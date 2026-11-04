@@ -1,0 +1,199 @@
+
+import os
+from typing import Any
+
+import ccxt.async_support as ccxt
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
+
+app = FastAPI(title="Crypto Analysis MVP")
+exchange = None
+
+TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d"}
+
+@app.on_event("startup")
+async def startup() -> None:
+    global exchange
+    exchange = ccxt.binance({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    if exchange is not None:
+        await exchange.close()
+
+@app.get("/api/markets")
+async def markets() -> list[dict[str, Any]]:
+    try:
+        items = await exchange.load_markets()
+        return [
+            {"symbol": symbol, "base": market["base"], "quote": market["quote"]}
+            for symbol, market in items.items()
+            if market.get("spot") and market.get("active") and market["quote"] == "USDT"
+        ]
+    except Exception as exc:
+        raise HTTPException(502, f"Exchange error: {exc}") from exc
+
+@app.get("/api/analyze")
+async def analyze(
+    symbol: str = Query("BTC/USDT"),
+    timeframe: str = Query("5m"),
+    limit: int = Query(200, ge=50, le=500),
+) -> dict[str, Any]:
+    if timeframe not in TIMEFRAMES:
+        raise HTTPException(400, "Unsupported timeframe")
+
+    try:
+        markets = await exchange.load_markets()
+        if symbol not in markets or not markets[symbol].get("spot"):
+            raise HTTPException(404, "Spot market not found")
+
+        rows = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        if len(rows) < 30:
+            raise HTTPException(502, "Not enough candle data")
+
+        df = pd.DataFrame(
+            rows, columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
+
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        df["rsi"] = 100 - (100 / (1 + rs))
+
+        prev_close = df["close"].shift(1)
+        true_range = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        df["atr"] = true_range.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+
+        # Basic three-candle fair value gaps.
+        fvgs = []
+        for i in range(2, len(df)):
+            if df.loc[i, "low"] > df.loc[i - 2, "high"]:
+                fvgs.append({
+                    "type": "bullish",
+                    "lower": float(df.loc[i - 2, "high"]),
+                    "upper": float(df.loc[i, "low"]),
+                    "candle_time": int(df.loc[i, "timestamp"]),
+                })
+            elif df.loc[i, "high"] < df.loc[i - 2, "low"]:
+                fvgs.append({
+                    "type": "bearish",
+                    "lower": float(df.loc[i, "high"]),
+                    "upper": float(df.loc[i - 2, "low"]),
+                    "candle_time": int(df.loc[i, "timestamp"]),
+                })
+
+        # Simple rolling swing levels and close-based BOS/MSS approximation.
+        window = 5
+        df["swing_high"] = df["high"].shift(1).rolling(window).max()
+        df["swing_low"] = df["low"].shift(1).rolling(window).min()
+        events = []
+        previous_direction = None
+
+        for i in range(window + 1, len(df)):
+            direction = None
+            if df.loc[i, "close"] > df.loc[i, "swing_high"]:
+                direction = "bullish"
+            elif df.loc[i, "close"] < df.loc[i, "swing_low"]:
+                direction = "bearish"
+
+            if direction:
+                event = "MSS" if previous_direction and direction != previous_direction else "BOS"
+                level = (
+                    float(df.loc[i, "swing_high"])
+                    if direction == "bullish"
+                    else float(df.loc[i, "swing_low"])
+                )
+                events.append({
+                    "type": event,
+                    "direction": direction,
+                    "level": level,
+                    "candle_time": int(df.loc[i, "timestamp"]),
+                })
+                previous_direction = direction
+
+        candles = df[["timestamp", "open", "high", "low", "close", "volume"]].to_dict("records")
+        # Convert numpy values to regular JSON-compatible Python values.
+        candles = [{k: int(v) if k == "timestamp" else float(v) for k, v in row.items()}
+                   for row in candles]
+
+        last = df.iloc[-1]
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles": candles,
+            "rsi": None if pd.isna(last["rsi"]) else round(float(last["rsi"]), 2),
+            "atr": None if pd.isna(last["atr"]) else round(float(last["atr"]), 8),
+            "fvgs": fvgs[-30:],
+            "structure_events": events[-30:],
+            "note": "Educational analysis only; no guaranteed next-candle prediction.",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Analysis failed: {exc}") from exc
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> str:
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crypto Analysis MVP</title>
+  <style>
+    body{font:15px system-ui;background:#10151d;color:#e8edf5;margin:24px}
+    select,button{padding:9px;margin:4px;background:#202b3a;color:white;border:1px solid #445}
+    pre{white-space:pre-wrap;background:#17202b;padding:14px;border-radius:8px}
+    .muted{color:#aab6c5}
+  </style>
+</head>
+<body>
+  <h2>Crypto Analysis MVP</h2>
+  <p class="muted">Spot market data and technical indicators; not a trading recommendation.</p>
+  <select id="symbol"></select>
+  <select id="timeframe">
+    <option>1m</option><option selected>5m</option><option>15m</option>
+    <option>1h</option><option>4h</option><option>1d</option>
+  </select>
+  <button onclick="run()">Analyze</button>
+  <pre id="result">Loading markets…</pre>
+<script>
+async function loadMarkets(){
+  const r = await fetch('/api/markets');
+  if(!r.ok) throw new Error(await r.text());
+  const markets = await r.json();
+  const select = document.getElementById('symbol');
+  select.innerHTML = markets.map(x => <option>${x.symbol}</option>).join('');
+  select.value = 'BTC/USDT';
+}
+async function run(){
+  const symbol = document.getElementById('symbol').value;
+  const timeframe = document.getElementById('timeframe').value;
+  const out = document.getElementById('result');
+  out.textContent = 'Fetching data…';
+  try {
+    const r = await fetch(/api/analyze?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe});
+    const data = await r.json();
+    if(!r.ok) throw new Error(data.detail || 'Request failed');
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch(e) { out.textContent = Error: ${e.message}; }
+}
+loadMarkets().then(run).catch(e => {
+  document.getElementById('result').textContent = Error: ${e.message};
+});
+</script>
+</body>
+</html>
